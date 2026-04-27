@@ -1,10 +1,11 @@
 manifestVersion: 1
 name: "@dougschaefer/openai-document"
-version: "2026.04.27.1"
+version: "2026.04.27.2"
 description: "OpenAI-powered document processing for .pptx and .docx — analyze structure, enhance text while preserving formatting, generate from templates, and design pixel-perfect PDFs from natural-language instructions via headless Chromium. Vault-based API key."
 repository: https://github.com/dougschaefer6/swamp-openai-document
 additionalFiles:
   - README.md
+  - LICENSE.txt
 labels:
   - openai
   - document
