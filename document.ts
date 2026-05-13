@@ -161,6 +161,90 @@ async function chatCompletion(
   return result.choices[0].message.content;
 }
 
+interface VisionImagePart {
+  type: "image_url";
+  image_url: { url: string; detail?: "low" | "high" | "auto" };
+}
+
+async function loadImageAsDataUrl(pathOrUrl: string): Promise<string> {
+  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+  const bytes = await Deno.readFile(pathOrUrl);
+  const lower = pathOrUrl.toLowerCase();
+  const mime = lower.endsWith(".png")
+    ? "image/png"
+    : lower.endsWith(".webp")
+    ? "image/webp"
+    : lower.endsWith(".gif")
+    ? "image/gif"
+    : "image/jpeg";
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return `data:${mime};base64,${btoa(binary)}`;
+}
+
+async function chatCompletionVision(
+  apiKey: string,
+  model: string,
+  systemPrompt: string,
+  userText: string,
+  imageRefs: string[],
+  maxTokens?: number,
+): Promise<string> {
+  const imageParts: VisionImagePart[] = [];
+  for (const ref of imageRefs) {
+    imageParts.push({
+      type: "image_url",
+      image_url: { url: await loadImageAsDataUrl(ref), detail: "high" },
+    });
+  }
+
+  const body: Record<string, unknown> = {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: [{ type: "text", text: userText }, ...imageParts],
+      },
+    ],
+    temperature: 0.5,
+  };
+  if (maxTokens) body.max_tokens = maxTokens;
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`OpenAI vision API error (${response.status}): ${err}`);
+  }
+  const result = await response.json();
+  return result.choices[0].message.content;
+}
+
+function stripJsonFences(s: string): string {
+  return s
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+}
+
+function stripHtmlFences(s: string): string {
+  return s
+    .replace(/^```html\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+}
+
 // ============================================================================
 // Schema
 // ============================================================================
@@ -176,9 +260,23 @@ const GlobalArgsSchema = z.object({
 // Model definition
 // ============================================================================
 
+/**
+ * `@dougschaefer/openai-document` model — OpenAI-driven document and
+ * webpage generation across .pptx, .docx, PDF, and HTML. Analyze
+ * parses an Office file into a structured content tree; enhance
+ * rewrites text in-place while preserving formatting; generate
+ * populates a template with fresh GPT-authored content. Compose
+ * expands a short outline into a fully-populated deck against a
+ * theme template. Design produces a pixel-precise PDF from natural-
+ * language design instructions, and webpageDesign emits a self-
+ * contained HTML/CSS page from reference design images via GPT
+ * vision. Auth is an OpenAI API key supplied via globalArguments
+ * (vault-resolved). The design and webpageDesign renderPreview
+ * paths require chromium-browser on PATH.
+ */
 export const model = {
   type: "@dougschaefer/openai-document",
-  version: "2026.04.17.2",
+  version: "2026.04.29.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     analysis: {
@@ -696,6 +794,348 @@ CSS TECHNIQUES to use:
             outputFile: outputPath,
             fileType,
             instructions: args.instructions,
+            model: args.model,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ================================================================
+    // compose — outline → multi-card .pptx using a theme template
+    // ================================================================
+    compose: {
+      description:
+        "Expand a text outline into a fully-populated .pptx using your supplied template as the visual theme. The template's existing slides act as layout placeholders — compose generates per-slide title, body bullets, and speaker notes via OpenAI structured output, then replaces the template's text in place. No third-party deck generator required.",
+      arguments: z.object({
+        outline: z.string().describe(
+          "Outline, brief, or source notes that compose will expand into slide content.",
+        ),
+        templatePath: z.string().describe(
+          "Absolute path to the .pptx template. Each slide in the template becomes one card; pre-trim or duplicate slides in the template to control the final card count.",
+        ),
+        tone: z.string().optional().describe(
+          "Voice/tone (e.g., 'executive briefing', 'technical deep dive', 'sales pitch').",
+        ),
+        audience: z.string().optional().describe(
+          "Who's reading the deck (e.g., 'CIO and IT directors', 'AV trade press').",
+        ),
+        additionalInstructions: z.string().optional().describe(
+          "Extra direction — what to emphasize, what to avoid, brand voice notes.",
+        ),
+        includeSpeakerNotes: z.boolean().default(true).describe(
+          "Generate speaker notes for each slide (written into ppt/notesSlidesN.xml when present).",
+        ),
+        model: z
+          .enum(["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"])
+          .default("gpt-4.1"),
+        outputName: z.string().default("composed-deck"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+
+        const zip = await JSZip.loadAsync(
+          await Deno.readFile(args.templatePath),
+        );
+        const { slides } = await parsePptx(zip);
+        if (slides.length === 0) {
+          throw new Error("Template .pptx contains no slides");
+        }
+        context.logger.info(
+          "Composing into {count} template slides with {model}",
+          { count: slides.length, model: args.model },
+        );
+
+        const slideStructure = slides.map((s) => ({
+          slide: s.index,
+          existingTitle: s.title,
+          existingBlocks: s.textBlocks,
+        }));
+
+        const systemPrompt =
+          `You are a senior presentation designer. You expand an outline into structured slide content for a deck whose visual theme is locked by a supplied template.
+
+INPUT: An outline plus a description of each template slide's existing text (title and body text blocks). The number of slides is fixed — distribute the outline across them.
+
+OUTPUT: Return ONLY a JSON array. No prose, no fences. Schema:
+[
+  {
+    "slide": <slide number, 1-indexed>,
+    "replacements": [
+      { "original": "<existing template text, exactly>", "replacement": "<new content>" }
+    ],
+    "speakerNotes": "<optional notes paragraph>"
+  }
+]
+
+RULES:
+- The "original" string MUST exactly match a string from existingTitle or existingBlocks for that slide. Do not invent placeholders.
+- Replace the title with a punchy slide title. Replace body blocks with concise points or sentences that fit the layout the original block occupied (a short header block stays short, a bullet block gets bullet-style content separated by line breaks, a paragraph block gets a paragraph).
+- Keep replacement length comparable to the original where layout matters; do not pack a 200-word essay into a one-line block.
+- Slide 1 should be a strong title slide. Final slide should be a clean wrap (next steps, summary, or call to action).
+- Speaker notes are optional but encouraged when speakerNotes generation is requested. Keep them to 2–4 sentences.
+- Do not output markdown formatting in replacements (no **, no #, no ---).`;
+
+        let userMsg =
+          `OUTLINE / SOURCE MATERIAL:\n${args.outline}\n\nTEMPLATE SLIDE STRUCTURE (JSON):\n${
+            JSON.stringify(slideStructure, null, 2)
+          }`;
+        if (args.tone) userMsg += `\n\nTONE: ${args.tone}`;
+        if (args.audience) userMsg += `\n\nAUDIENCE: ${args.audience}`;
+        if (args.additionalInstructions) {
+          userMsg +=
+            `\n\nADDITIONAL INSTRUCTIONS: ${args.additionalInstructions}`;
+        }
+        if (!args.includeSpeakerNotes) {
+          userMsg += `\n\nSpeaker notes: omit (return empty string).`;
+        }
+
+        const resp = await chatCompletion(
+          g.apiKey,
+          args.model,
+          systemPrompt,
+          userMsg,
+          12000,
+        );
+
+        const plan = JSON.parse(stripJsonFences(resp)) as Array<{
+          slide: number;
+          replacements: Array<{ original: string; replacement: string }>;
+          speakerNotes?: string;
+        }>;
+
+        for (const slidePlan of plan) {
+          const slide = slides.find((s) => s.index === slidePlan.slide);
+          if (!slide) continue;
+          const xml = await zip.file(slide.xmlPath)?.async("string");
+          if (!xml) continue;
+
+          const reps = new Map<string, string>();
+          for (const r of slidePlan.replacements) {
+            if (r.original && r.replacement) {
+              reps.set(r.original, r.replacement);
+            }
+          }
+          if (reps.size > 0) {
+            zip.file(slide.xmlPath, replaceTextInXml(xml, "a:t", reps));
+          }
+
+          if (args.includeSpeakerNotes && slidePlan.speakerNotes) {
+            const notesPath = `ppt/notesSlides/notesSlide${slide.index}.xml`;
+            const notesXml = await zip.file(notesPath)?.async("string");
+            if (notesXml && slide.speakerNotes) {
+              zip.file(
+                notesPath,
+                replaceTextInXml(
+                  notesXml,
+                  "a:t",
+                  new Map([[slide.speakerNotes, slidePlan.speakerNotes]]),
+                ),
+              );
+            }
+          }
+        }
+
+        const outputDir = `${context.repoDir}/.swamp/generated-documents`;
+        await Deno.mkdir(outputDir, { recursive: true });
+        const fileName = `${args.outputName}-${Date.now()}.pptx`;
+        const outputPath = `${outputDir}/${fileName}`;
+        await Deno.writeFile(
+          outputPath,
+          await zip.generateAsync({ type: "uint8array" }),
+        );
+        context.logger.info("Composed deck saved to {path}", {
+          path: outputPath,
+        });
+
+        const winDownloadsPath = "/mnt/c/Users/DougSchaefer/Downloads";
+        try {
+          await Deno.stat(winDownloadsPath);
+          await Deno.copyFile(outputPath, `${winDownloadsPath}/${fileName}`);
+          context.logger.info("Copied to Windows Downloads: {name}", {
+            name: fileName,
+          });
+        } catch {
+          // not in WSL with Windows mounted, skip
+        }
+
+        const handle = await context.writeResource(
+          "document",
+          args.outputName,
+          {
+            sourceFile: args.templatePath,
+            outputFile: outputPath,
+            fileType: "pptx",
+            instructions: args.outline.slice(0, 500),
+            model: args.model,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ================================================================
+    // webpageDesign — reference designs → self-contained HTML/CSS page
+    // ================================================================
+    webpageDesign: {
+      description:
+        "Generate a self-contained responsive HTML/CSS webpage that mimics the visual language of one or more reference designs (image files or URLs). GPT vision analyzes layout, typography, color, and motifs from the references, then produces a single HTML file populated with your supplied content. Optionally renders a PNG/PDF preview via headless Chromium.",
+      arguments: z.object({
+        brief: z.string().describe(
+          "What the page is for and the content/copy it should contain. Include headings, body copy, and any required sections.",
+        ),
+        references: z.array(z.string()).min(1).describe(
+          "Reference design images — local file paths (.png/.jpg/.webp/.gif) or http(s) URLs. The model uses these for visual cues only; copy must come from the brief.",
+        ),
+        styleNotes: z.string().optional().describe(
+          "Extra style direction — brand color overrides, fonts to prefer, accessibility requirements, etc.",
+        ),
+        responsive: z.boolean().default(true).describe(
+          "Include mobile-first responsive layout with media queries.",
+        ),
+        renderPreview: z.boolean().default(false).describe(
+          "If true, render the HTML to a PNG screenshot (and PDF) via headless Chromium.",
+        ),
+        model: z
+          .enum(["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"])
+          .default("gpt-4.1"),
+        outputName: z.string().default("webpage"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+
+        context.logger.info(
+          "Designing webpage from {count} reference(s) with {model}",
+          { count: args.references.length, model: args.model },
+        );
+
+        const systemPrompt =
+          `You are an expert web designer. Given one or more reference design images, you analyze their visual language and produce a single self-contained HTML page that captures the same look and feel using new content the user provides.
+
+OUTPUT: Return ONLY a complete HTML document starting with <!DOCTYPE html> and ending with </html>. No markdown fences, no explanation.
+
+ANALYSIS: First study the references for:
+- Overall layout and section rhythm (hero, feature grid, columns, full-bleed sections)
+- Typography pairing (display vs body), weights, sizes, line-height
+- Color palette — pull primary, accent, neutral, and any contrast/CTA colors
+- Spacing and density (generous whitespace vs packed)
+- Visual motifs (cards, gradients, geometric accents, image treatments)
+- Component styles (buttons, navigation, footer)
+
+DESIGN REQUIREMENTS:
+- Single self-contained HTML file. All CSS inline in <style>. No external resources except Google Fonts via @import.
+- Modern, accessible markup (semantic elements, alt text on images, labeled controls).
+- No JavaScript unless the brief requires it; prefer CSS-only interactions.
+- Use the user's content verbatim — do not invent product names, prices, or claims that aren't in the brief.
+- For images, use simple <div> placeholders with CSS background-color or gradient unless the brief provides image URLs.
+- If responsive is requested, design mobile-first with at least one breakpoint.
+- Output should look hand-designed, not template-generated. Pull every visual cue you can from the references — color, type, spacing, decorative elements.`;
+
+        let userText = `BRIEF / CONTENT:\n${args.brief}`;
+        if (args.styleNotes) userText += `\n\nSTYLE NOTES: ${args.styleNotes}`;
+        userText += `\n\nRESPONSIVE: ${args.responsive ? "yes" : "no"}`;
+        userText +=
+          `\n\nThe attached images are visual references. Mimic their style; use the brief for content.`;
+
+        const html = await chatCompletionVision(
+          g.apiKey,
+          args.model,
+          systemPrompt,
+          userText,
+          args.references,
+          16000,
+        );
+        const cleanHtml = stripHtmlFences(html);
+
+        const outputDir = `${context.repoDir}/.swamp/generated-documents`;
+        await Deno.mkdir(outputDir, { recursive: true });
+        const timestamp = Date.now();
+        const htmlPath = `${outputDir}/${args.outputName}-${timestamp}.html`;
+        await Deno.writeTextFile(htmlPath, cleanHtml);
+        context.logger.info("HTML saved to {path} ({size} chars)", {
+          path: htmlPath,
+          size: cleanHtml.length,
+        });
+
+        let pdfPath: string | undefined;
+        let pngPath: string | undefined;
+        if (args.renderPreview) {
+          pdfPath = `${outputDir}/${args.outputName}-${timestamp}.pdf`;
+          pngPath = `${outputDir}/${args.outputName}-${timestamp}.png`;
+
+          const pdfCmd = new Deno.Command("chromium-browser", {
+            args: [
+              "--headless",
+              "--disable-gpu",
+              "--no-sandbox",
+              "--disable-software-rasterizer",
+              `--print-to-pdf=${pdfPath}`,
+              "--print-to-pdf-no-header",
+              htmlPath,
+            ],
+            stdout: "piped",
+            stderr: "piped",
+          });
+          await pdfCmd.output();
+
+          const pngCmd = new Deno.Command("chromium-browser", {
+            args: [
+              "--headless",
+              "--disable-gpu",
+              "--no-sandbox",
+              "--disable-software-rasterizer",
+              "--window-size=1440,2400",
+              `--screenshot=${pngPath}`,
+              htmlPath,
+            ],
+            stdout: "piped",
+            stderr: "piped",
+          });
+          await pngCmd.output();
+
+          try {
+            await Deno.stat(pdfPath);
+            context.logger.info("PDF preview rendered: {path}", {
+              path: pdfPath,
+            });
+          } catch {
+            pdfPath = undefined;
+          }
+          try {
+            await Deno.stat(pngPath);
+            context.logger.info("PNG preview rendered: {path}", {
+              path: pngPath,
+            });
+          } catch {
+            pngPath = undefined;
+          }
+        }
+
+        const winDownloadsPath = "/mnt/c/Users/DougSchaefer/Downloads";
+        try {
+          await Deno.stat(winDownloadsPath);
+          await Deno.copyFile(
+            htmlPath,
+            `${winDownloadsPath}/${args.outputName}-${timestamp}.html`,
+          );
+          if (pngPath) {
+            await Deno.copyFile(
+              pngPath,
+              `${winDownloadsPath}/${args.outputName}-${timestamp}.png`,
+            );
+          }
+        } catch {
+          // not on WSL, skip
+        }
+
+        const handle = await context.writeResource(
+          "document",
+          args.outputName,
+          {
+            sourceFile: args.references.join(","),
+            outputFile: htmlPath,
+            fileType: "html",
+            instructions: args.brief.slice(0, 500),
             model: args.model,
           },
         );

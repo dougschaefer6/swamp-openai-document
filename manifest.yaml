@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@dougschaefer/openai-document"
-version: "2026.04.27.2"
-description: "OpenAI-powered document processing for .pptx and .docx — analyze structure, enhance text while preserving formatting, generate from templates, and design pixel-perfect PDFs from natural-language instructions via headless Chromium. Vault-based API key."
+version: "2026.05.13.1"
+description: "OpenAI-powered document and webpage generation — analyze and enhance .pptx/.docx, design PDFs from natural language, compose decks from outlines using your own theme template, and generate self-contained HTML/CSS pages from reference designs via vision. Vault-based API key, headless Chromium for rendering."
 repository: https://github.com/dougschaefer6/swamp-openai-document
 additionalFiles:
   - README.md
@@ -14,6 +14,11 @@ labels:
   - powerpoint
   - word
   - pdf
+  - html
+  - webpage
+  - design
+  - vision
+  - presentation
   - ai
   - generation
   - template
